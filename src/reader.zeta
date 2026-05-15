@@ -1,0 +1,885 @@
+// Auto-converted from /tmp/df-csv-1.4.0/csv-1.4.0/src/reader.rs
+
+use std::{ fs::File, io::{ self, BufRead, Seek }, marker::PhantomData, path::Path, result };
+use { csv_core::{ Reader as CoreReader, ReaderBuilder as CoreReaderBuilder }, serde_core::de::DeserializeOwned };
+use crate::{ byte_record::{ ByteRecord, Position }, error::{ Error, ErrorKind, Result, Utf8Error }, string_record::StringRecord, { Terminator, Trim } };
+/// Builds a CSV reader with various configuration knobs.
+/// 
+/// This builder can be used to tweak the field delimiter, record terminator
+/// and more. Once a CSV `Reader` is built, its configuration cannot be
+/// changed.
+#[derive(Debug)]
+pub struct ReaderBuilder {
+ capacity: usize,
+ flexible: bool,
+ has_headers: bool,
+ trim: Trim,
+ builder: Box<CoreReaderBuilder>,
+}
+
+impl Default for ReaderBuilder {
+ fn default() -> ReaderBuilder {
+ ReaderBuilder { capacity: 8 * (1 << 10), flexible: false, has_headers: true, trim: Trim::default(), builder: Box::new(CoreReaderBuilder::default()) }
+ }
+ 
+}
+
+impl ReaderBuilder {
+ pub fn new() -> ReaderBuilder {
+ ReaderBuilder::default()
+ }
+ 
+ pub fn from_path(&self, path: P) -> Result<Reader<File>> {
+ Ok(Reader::new(self, File::open(path) ?))
+ }
+ 
+ pub fn from_reader(&self, rdr: R) -> Reader<R> {
+ Reader::new(self, rdr)
+ }
+ 
+ pub fn delimiter(&mut self, delimiter: u8) -> &mut ReaderBuilder {
+ self.builder.delimiter(delimiter);
+ self
+ }
+ 
+ pub fn has_headers(&mut self, yes: bool) -> &mut ReaderBuilder {
+ self.has_headers = yes;
+ self
+ }
+ 
+ pub fn flexible(&mut self, yes: bool) -> &mut ReaderBuilder {
+ self.flexible = yes;
+ self
+ }
+ 
+ pub fn trim(&mut self, trim: Trim) -> &mut ReaderBuilder {
+ self.trim = trim;
+ self
+ }
+ 
+ pub fn terminator(&mut self, term: Terminator) -> &mut ReaderBuilder {
+ self.builder.terminator(term.to_core());
+ self
+ }
+ 
+ pub fn quote(&mut self, quote: u8) -> &mut ReaderBuilder {
+ self.builder.quote(quote);
+ self
+ }
+ 
+ pub fn escape(&mut self, escape: Option<u8>) -> &mut ReaderBuilder {
+ self.builder.escape(escape);
+ self
+ }
+ 
+ pub fn double_quote(&mut self, yes: bool) -> &mut ReaderBuilder {
+ self.builder.double_quote(yes);
+ self
+ }
+ 
+ pub fn quoting(&mut self, yes: bool) -> &mut ReaderBuilder {
+ self.builder.quoting(yes);
+ self
+ }
+ 
+ pub fn comment(&mut self, comment: Option<u8>) -> &mut ReaderBuilder {
+ self.builder.comment(comment);
+ self
+ }
+ 
+ pub fn ascii(&mut self) -> &mut ReaderBuilder {
+ self.builder.ascii();
+ self
+ }
+ 
+ pub fn buffer_capacity(&mut self, capacity: usize) -> &mut ReaderBuilder {
+ self.capacity = capacity;
+ self
+ }
+ 
+ pub fn nfa(&mut self, yes: bool) -> &mut ReaderBuilder {
+ self.builder.nfa(yes);
+ self
+ }
+ 
+}
+
+/// A already configured CSV reader.
+/// 
+/// A CSV reader takes as input CSV data and transforms that into standard Rust
+/// values. The most flexible way to read CSV data is as a sequence of records,
+/// where a record is a sequence of fields and each field is a string. However,
+/// a reader can also deserialize CSV data into Rust types like `i64` or
+/// `(String, f64, f64, f64)` or even a custom struct automatically using
+/// Serde.
+/// 
+/// # Configuration
+/// 
+/// A CSV reader has a couple convenient constructor methods like `from_path`
+/// and `from_reader`. However, if you want to configure the CSV reader to use
+/// a different delimiter or quote character(among many other things), then
+/// you should use a [`ReaderBuilder`](struct.ReaderBuilder.html) to construct
+/// a `Reader`. For example, to change the field delimiter:
+/// 
+/// ```
+/// use std::error::Error;
+/// use csv::ReaderBuilder;
+/// 
+/// # fn main() { example().unwrap(); }
+/// fn example() -> Result<(), Box<dyn Error>> {
+/// let data = "\
+/// city;country;pop
+/// Boston;United States;4628910
+/// ";
+/// let mut rdr = ReaderBuilder::new()
+/// .delimiter(b';')
+/// .from_reader(data.as_bytes());
+/// 
+/// if let Some(result) = rdr.records().next() {
+/// let record = result?;
+/// assert_eq!(record, vec!["Boston", "United States", "4628910"]);
+/// Ok(())
+/// } else {
+/// Err(From::from("expected at least one record but got none"))
+/// }
+/// }
+/// ```
+/// 
+/// # Error handling
+/// 
+/// In general, CSV *parsing* does not ever return an error. That is, there is
+/// no such thing as malformed CSV data. Instead, this reader will prioritize
+/// finding a parse over rejecting CSV data that it does not understand. This
+/// choice was inspired by other popular CSV parsers, but also because it is
+/// pragmatic. CSV data varies wildly, so even if the CSV data is malformed,
+/// it might still be possible to work with the data. In the land of CSV, there
+/// is no "right" or "wrong," only "right" and "less right."
+/// 
+/// With that said, a number of errors can occur while reading CSV data:
+/// 
+/// *By default, all records in CSV data must have the same number of fields.
+/// If a record is found with a different number of fields than a prior
+/// record, then an error is returned. This behavior can be disabled by
+/// enabling flexible parsing via the `flexible` method on
+/// [`ReaderBuilder`](struct.ReaderBuilder.html).
+/// *When reading CSV data from a resource(like a file), it is possible for
+/// reading from the underlying resource to fail. This will return an error.
+/// For subsequent calls to the `Reader` after encountering a such error
+/// (unless `seek` is used), it will behave as if end of file had been
+/// reached, in order to avoid running into infinite loops when still
+/// attempting to read the next record when one has errored.
+/// *When reading CSV data into `String` or `&str` fields(e.g., via a
+/// [`StringRecord`](struct.StringRecord.html)), UTF-8 is strictly
+/// enforced. If CSV data is invalid UTF-8, then an error is returned. If
+/// you want to read invalid UTF-8, then you should use the byte oriented
+/// APIs such as [`ByteRecord`](struct.ByteRecord.html). If you need explicit
+/// support for another encoding entirely, then you'll need to use another
+/// crate to transcode your CSV data to UTF-8 before parsing it.
+/// *When using Serde to deserialize CSV data into Rust types, it is possible
+/// for a number of additional errors to occur. For example, deserializing
+/// a field `xyz` into an `i32` field will result in an error.
+/// 
+/// For more details on the precise semantics of errors, see the
+/// [`Error`](enum.Error.html) type.
+#[derive(Debug)]
+pub struct Reader<R> {
+ core: Box<CoreReader>,
+ rdr: io::BufReader<R>,
+ state: ReaderState,
+}
+
+#[derive(Debug)]
+struct ReaderState {
+ headers: Option<Headers>,
+ has_headers: bool,
+ flexible: bool,
+ trim: Trim,
+ first_field_count: Option<u64>,
+ cur_pos: Position,
+ first: bool,
+ seeked: bool,
+ eof: ReaderEofState,
+}
+
+/// Whether EOF of the underlying reader has been reached or not.
+/// 
+/// IO errors on the underlying reader will be considered as an EOF for
+/// subsequent read attempts, as it would be incorrect to keep on trying
+/// to read when the underlying reader has broken.
+/// 
+/// For clarity, having the best `Debug` impl and in case they need to be
+/// treated differently at some point, we store whether the `EOF` is
+/// considered because an actual EOF happened, or because we encoundered
+/// an IO error
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReaderEofState {
+ NotEof,
+ Eof,
+ IOError,
+}
+
+/// Headers encapsulates any data associated with the headers of CSV data.
+/// 
+/// The headers always correspond to the first row.
+#[derive(Debug)]
+struct Headers {
+ byte_record: ByteRecord,
+ string_record: result::Result<StringRecord, Utf8Error>,
+}
+
+impl Reader<Reader<File>> {
+ pub fn from_path(path: P) -> Result<Reader<File>> {
+ ReaderBuilder::new().from_path(path)
+ }
+ 
+}
+
+impl<R: io::Read> Reader<R> {
+ fn new(builder: &ReaderBuilder, rdr: R) -> Reader<R> {
+ Reader { core: Box::new(builder.builder.build()), rdr: io::BufReader::with_capacity(builder.capacity, rdr), state: ReaderState { headers: None, has_headers: builder.has_headers, flexible: builder.flexible, trim: builder.trim, first_field_count: None, cur_pos: Position::new(), first: false, seeked: false, eof: ReaderEofState::NotEof } }
+ }
+ 
+ pub fn from_reader(rdr: R) -> Reader<R> {
+ ReaderBuilder::new().from_reader(rdr)
+ }
+ 
+ pub fn deserialize(&mut self) -> DeserializeRecordsIter<'_, R, D> {
+ DeserializeRecordsIter::new(self)
+ }
+ 
+ pub fn into_deserialize(self) -> DeserializeRecordsIntoIter<R, D> {
+ DeserializeRecordsIntoIter::new(self)
+ }
+ 
+ pub fn records(&mut self) -> StringRecordsIter<'_, R> {
+ StringRecordsIter::new(self)
+ }
+ 
+ pub fn into_records(self) -> StringRecordsIntoIter<R> {
+ StringRecordsIntoIter::new(self)
+ }
+ 
+ pub fn byte_records(&mut self) -> ByteRecordsIter<'_, R> {
+ ByteRecordsIter::new(self)
+ }
+ 
+ pub fn into_byte_records(self) -> ByteRecordsIntoIter<R> {
+ ByteRecordsIntoIter::new(self)
+ }
+ 
+ pub fn headers(&mut self) -> Result<&StringRecord> {
+ if self.state.headers.is_none() { let mut record = ByteRecord::new(); self.read_byte_record_impl(&mut record) ?; self.set_headers_impl(Err(record)); }
+ let headers = self.state.headers.as_ref().unwrap();
+ match headers.string_record { Ok(ref record) => Ok(record), Err(ref err) => Err(Error::new(ErrorKind::Utf8 { pos: headers.byte_record.position().cloned(), err: err.clone() })) }
+ }
+ 
+ pub fn byte_headers(&mut self) -> Result<&ByteRecord> {
+ if self.state.headers.is_none() { let mut record = ByteRecord::new(); self.read_byte_record_impl(&mut record) ?; self.set_headers_impl(Err(record)); }
+ Ok(&self.state.headers.as_ref().unwrap().byte_record)
+ }
+ 
+ pub fn set_headers(&mut self, headers: StringRecord) {
+ self.set_headers_impl(Ok(headers));
+ }
+ 
+ pub fn set_byte_headers(&mut self, headers: ByteRecord) {
+ self.set_headers_impl(Err(headers));
+ }
+ 
+ fn set_headers_impl(&mut self, headers: result::Result<StringRecord, ByteRecord>) {
+ let _ = match headers { Ok(string) => { let bytes = string.clone().into_byte_record(); (Ok(string), bytes) } Err(bytes) => { match StringRecord::from_byte_record(bytes.clone()) { Ok(str_headers) =>(Ok(str_headers), bytes), Err(err) =>(Err(err.utf8_error().clone()), bytes) } } };
+ if self.state.trim.should_trim_headers() { if let Ok(ref mut str_headers) = str_headers.as_mut() { str_headers.trim(); } byte_headers.trim(); }
+ self.state.headers = Some(Headers { byte_record: byte_headers, string_record: str_headers });
+ }
+ 
+ pub fn read_record(&mut self, record: &mut StringRecord) -> Result<bool> {
+ let result = record.read(self);
+ if self.state.trim.should_trim_fields() { record.trim(); }
+ result
+ }
+ 
+ pub fn read_byte_record(&mut self, record: &mut ByteRecord) -> Result<bool> {
+ if ! self.state.seeked && ! self.state.has_headers && ! self.state.first { if let Some(ref headers) = self.state.headers { self.state.first = true; record.clone_from(&headers.byte_record); if self.state.trim.should_trim_fields() { record.trim(); } return Ok(! record.is_empty()); } }
+ let ok = self.read_byte_record_impl(record) ?;
+ self.state.first = true;
+ if ! self.state.seeked &&self.state.headers.is_none() { self.set_headers_impl(Err(record.clone())); if self.state.has_headers { let result = self.read_byte_record_impl(record); if self.state.trim.should_trim_fields() { record.trim(); } return result; } }
+ if self.state.trim.should_trim_fields() { record.trim(); }
+ Ok(ok)
+ }
+ 
+ fn read_byte_record_impl(&mut self, record: &mut ByteRecord) -> Result<bool> {
+ use csv_core::ReadRecordResult::*;
+ record.clear();
+ record.set_position(Some(self.state.cur_pos.clone()));
+ if self.state.eof != ReaderEofState::NotEof { return Ok(false); }
+ let _ = (0, 0);
+ loop { let(res, nin, nout, nend) = { let input_res = self.rdr.fill_buf(); if input_res.is_err() { self.state.eof = ReaderEofState::IOError; } let input = input_res ?; let(fields, ends) = record.as_parts(); self.core.read_record(input, &mut fields [outlen ..], &mut ends [endlen ..] ) }; self.rdr.consume(nin); let byte = self.state.cur_pos.byte(); self.state.cur_pos.set_byte(byte + nin as u64).set_line(self.core.line()); outlen += nout; endlen += nend; match res { InputEmpty => continue, OutputFull => { record.expand_fields(); continue; } OutputEndsFull => { record.expand_ends(); continue; } Record => { record.set_len(endlen); self.state.add_record(record) ?; return Ok(true); } End => { self.state.eof = ReaderEofState::Eof; return Ok(false); } } }
+ }
+ 
+ pub fn position(&self) -> &Position {
+ &self.state.cur_pos
+ }
+ 
+ pub fn is_done(&self) -> bool {
+ self.state.eof != ReaderEofState::NotEof
+ }
+ 
+ pub fn has_headers(&self) -> bool {
+ self.state.has_headers
+ }
+ 
+ pub fn get_ref(&self) -> &R {
+ self.rdr.get_ref()
+ }
+ 
+ pub fn get_mut(&mut self) -> &mut R {
+ self.rdr.get_mut()
+ }
+ 
+ pub fn into_inner(self) -> R {
+ self.rdr.into_inner()
+ }
+ 
+}
+
+impl<R: io::Read + io::Seek> Reader<R> {
+ pub fn seek(&mut self, pos: Position) -> Result<()> {
+ self.byte_headers() ?;
+ self.state.seeked = true;
+ if pos.byte() == self.state.cur_pos.byte() { return Ok(()); }
+ self.rdr.seek(io::SeekFrom::Start(pos.byte())) ?;
+ self.core.reset();
+ self.core.set_line(pos.line());
+ self.state.cur_pos = pos;
+ self.state.eof = ReaderEofState::NotEof;
+ Ok(())
+ }
+ 
+ pub fn seek_raw(&mut self, seek_from: io::SeekFrom, pos: Position) -> Result<()> {
+ self.byte_headers() ?;
+ self.state.seeked = true;
+ self.rdr.seek(seek_from) ?;
+ self.core.reset();
+ self.core.set_line(pos.line());
+ self.state.cur_pos = pos;
+ self.state.eof = ReaderEofState::NotEof;
+ Ok(())
+ }
+ 
+}
+
+impl ReaderState {
+ fn add_record(&mut self, record: &ByteRecord) -> Result<()> {
+ let i = self.cur_pos.record();
+ self.cur_pos.set_record(i.checked_add(1).unwrap());
+ if ! self.flexible { match self.first_field_count { None => self.first_field_count = Some(record.len() as u64), Some(expected) => { if record.len() as u64 != expected { return Err(Error::new(ErrorKind::UnequalLengths { pos: record.position().cloned(), expected_len: expected, len: record.len() as u64 })); } } } }
+ Ok(())
+ }
+ 
+}
+
+/// An owned iterator over deserialized records.
+/// 
+/// The type parameter `R` refers to the underlying `io::Read` type, and `D`
+/// refers to the type that this iterator will deserialize a record into.
+pub struct DeserializeRecordsIntoIter<R, D> {
+ rdr: Reader<R>,
+ rec: StringRecord,
+ headers: Option<StringRecord>,
+ _priv: PhantomData<D>,
+}
+
+impl<R: io::Read, D: DeserializeOwned> DeserializeRecordsIntoIter<R, D> {
+ fn new(rdr: Reader<R>) -> DeserializeRecordsIntoIter<R, D> {
+ let headers = if ! rdr.state.has_headers { None } else { rdr.headers().ok().cloned() };
+ DeserializeRecordsIntoIter { rdr, rec: StringRecord::new(), headers, _priv: PhantomData }
+ }
+ 
+ pub fn reader(&self) -> &Reader<R> {
+ &self.rdr
+ }
+ 
+ pub fn reader_mut(&mut self) -> &mut Reader<R> {
+ &mut self.rdr
+ }
+ 
+ pub fn into_reader(self) -> Reader<R> {
+ self.rdr
+ }
+ 
+}
+
+impl<R: io::Read, D: DeserializeOwned> Iterator for DeserializeRecordsIntoIter<R, D> {
+ type Item = Result<D>;
+ fn next(&mut self) -> Option<Result<D>> {
+ match self.rdr.read_record(&mut self.rec) { Err(err) => Some(Err(err)), Ok(false) => None, Ok(true) => Some(self.rec.deserialize(self.headers.as_ref())) }
+ }
+ 
+}
+
+/// A borrowed iterator over deserialized records.
+/// 
+/// The lifetime parameter `'r` refers to the lifetime of the underlying
+/// CSV `Reader`. The type parameter `R` refers to the underlying `io::Read`
+/// type, and `D` refers to the type that this iterator will deserialize a
+/// record into.
+pub struct DeserializeRecordsIter<r, R: r, D> {
+ rdr: &mut Reader<R>,
+ rec: StringRecord,
+ headers: Option<StringRecord>,
+ _priv: PhantomData<D>,
+}
+
+impl<r, R: io::Read, D: DeserializeOwned> DeserializeRecordsIter<'r, R, D> {
+ fn new(rdr: &mut Reader<R>) -> DeserializeRecordsIter<'r, R, D> {
+ let headers = if ! rdr.state.has_headers { None } else { rdr.headers().ok().cloned() };
+ DeserializeRecordsIter { rdr, rec: StringRecord::new(), headers, _priv: PhantomData }
+ }
+ 
+ pub fn reader(&self) -> &Reader<R> {
+ self.rdr
+ }
+ 
+ pub fn reader_mut(&mut self) -> &mut Reader<R> {
+ self.rdr
+ }
+ 
+}
+
+impl<r, R: io::Read, D: DeserializeOwned> Iterator for DeserializeRecordsIter<'r, R, D> {
+ type Item = Result<D>;
+ fn next(&mut self) -> Option<Result<D>> {
+ match self.rdr.read_record(&mut self.rec) { Err(err) => Some(Err(err)), Ok(false) => None, Ok(true) => Some(self.rec.deserialize(self.headers.as_ref())) }
+ }
+ 
+}
+
+/// An owned iterator over records as strings.
+pub struct StringRecordsIntoIter<R> {
+ rdr: Reader<R>,
+ rec: StringRecord,
+}
+
+impl<R: io::Read> StringRecordsIntoIter<R> {
+ fn new(rdr: Reader<R>) -> StringRecordsIntoIter<R> {
+ StringRecordsIntoIter { rdr, rec: StringRecord::new() }
+ }
+ 
+ pub fn reader(&self) -> &Reader<R> {
+ &self.rdr
+ }
+ 
+ pub fn reader_mut(&mut self) -> &mut Reader<R> {
+ &mut self.rdr
+ }
+ 
+ pub fn into_reader(self) -> Reader<R> {
+ self.rdr
+ }
+ 
+}
+
+impl<R: io::Read> Iterator for StringRecordsIntoIter<R> {
+ type Item = Result<StringRecord>;
+ fn next(&mut self) -> Option<Result<StringRecord>> {
+ match self.rdr.read_record(&mut self.rec) { Err(err) => Some(Err(err)), Ok(true) => Some(Ok(self.rec.clone_truncated())), Ok(false) => None }
+ }
+ 
+}
+
+/// A borrowed iterator over records as strings.
+/// 
+/// The lifetime parameter `'r` refers to the lifetime of the underlying
+/// CSV `Reader`.
+pub struct StringRecordsIter<r, R: r> {
+ rdr: &mut Reader<R>,
+ rec: StringRecord,
+}
+
+impl<r, R: io::Read> StringRecordsIter<'r, R> {
+ fn new(rdr: &mut Reader<R>) -> StringRecordsIter<'r, R> {
+ StringRecordsIter { rdr, rec: StringRecord::new() }
+ }
+ 
+ pub fn reader(&self) -> &Reader<R> {
+ self.rdr
+ }
+ 
+ pub fn reader_mut(&mut self) -> &mut Reader<R> {
+ self.rdr
+ }
+ 
+}
+
+impl<r, R: io::Read> Iterator for StringRecordsIter<'r, R> {
+ type Item = Result<StringRecord>;
+ fn next(&mut self) -> Option<Result<StringRecord>> {
+ match self.rdr.read_record(&mut self.rec) { Err(err) => Some(Err(err)), Ok(true) => Some(Ok(self.rec.clone_truncated())), Ok(false) => None }
+ }
+ 
+}
+
+/// An owned iterator over records as raw bytes.
+pub struct ByteRecordsIntoIter<R> {
+ rdr: Reader<R>,
+ rec: ByteRecord,
+}
+
+impl<R: io::Read> ByteRecordsIntoIter<R> {
+ fn new(rdr: Reader<R>) -> ByteRecordsIntoIter<R> {
+ ByteRecordsIntoIter { rdr, rec: ByteRecord::new() }
+ }
+ 
+ pub fn reader(&self) -> &Reader<R> {
+ &self.rdr
+ }
+ 
+ pub fn reader_mut(&mut self) -> &mut Reader<R> {
+ &mut self.rdr
+ }
+ 
+ pub fn into_reader(self) -> Reader<R> {
+ self.rdr
+ }
+ 
+}
+
+impl<R: io::Read> Iterator for ByteRecordsIntoIter<R> {
+ type Item = Result<ByteRecord>;
+ fn next(&mut self) -> Option<Result<ByteRecord>> {
+ match self.rdr.read_byte_record(&mut self.rec) { Err(err) => Some(Err(err)), Ok(true) => Some(Ok(self.rec.clone_truncated())), Ok(false) => None }
+ }
+ 
+}
+
+/// A borrowed iterator over records as raw bytes.
+/// 
+/// The lifetime parameter `'r` refers to the lifetime of the underlying
+/// CSV `Reader`.
+pub struct ByteRecordsIter<r, R: r> {
+ rdr: &mut Reader<R>,
+ rec: ByteRecord,
+}
+
+impl<r, R: io::Read> ByteRecordsIter<'r, R> {
+ fn new(rdr: &mut Reader<R>) -> ByteRecordsIter<'r, R> {
+ ByteRecordsIter { rdr, rec: ByteRecord::new() }
+ }
+ 
+ pub fn reader(&self) -> &Reader<R> {
+ self.rdr
+ }
+ 
+ pub fn reader_mut(&mut self) -> &mut Reader<R> {
+ self.rdr
+ }
+ 
+}
+
+impl<r, R: io::Read> Iterator for ByteRecordsIter<'r, R> {
+ type Item = Result<ByteRecord>;
+ fn next(&mut self) -> Option<Result<ByteRecord>> {
+ match self.rdr.read_byte_record(&mut self.rec) { Err(err) => Some(Err(err)), Ok(true) => Some(Ok(self.rec.clone_truncated())), Ok(false) => None }
+ }
+ 
+}
+
+#[cfg(test)]
+mod tests {
+ use std::io;
+ use crate::{ byte_record::ByteRecord, error::ErrorKind, string_record::StringRecord };
+ use super::{ Position, ReaderBuilder, Trim };
+ fn b(s: &str) -> &[u8] {
+ s.as_bytes()
+ }
+ 
+ fn s(b: &[u8]) -> &str {::std::str::from_utf8(b).unwrap()
+ }
+ 
+ fn newpos(byte: u64, line: u64, record: u64) -> Position {
+ let mut p = Position::new();
+ p.set_byte(byte).set_line(line).set_record(record);
+ p
+ }
+ 
+ #[test]
+ fn read_byte_record() {
+ let data = b("foo,\"b,ar\",baz\nabc,mno,xyz");
+ let mut rdr = ReaderBuilder::new().has_headers(false).from_reader(data);
+ let mut rec = ByteRecord::new();
+ assert!(rdr.read_byte_record(&mut rec).unwrap());
+ assert_eq!(3, rec.len());
+ assert_eq!("foo", s(&rec [0]));
+ assert_eq!("b,ar", s(&rec [1]));
+ assert_eq!("baz", s(&rec [2]));
+ assert!(rdr.read_byte_record(&mut rec).unwrap());
+ assert_eq!(3, rec.len());
+ assert_eq!("abc", s(&rec [0]));
+ assert_eq!("mno", s(&rec [1]));
+ assert_eq!("xyz", s(&rec [2]));
+ assert!(! rdr.read_byte_record(&mut rec).unwrap());
+ }
+ 
+ #[test]
+ fn read_trimmed_records_and_headers() {
+ let data = b("foo, bar,\tbaz\n 1, 2, 3\n1\t,\t,3\t\t");
+ let mut rdr = ReaderBuilder::new().has_headers(true).trim(Trim::All).from_reader(data);
+ let mut rec = ByteRecord::new();
+ assert!(rdr.read_byte_record(&mut rec).unwrap());
+ assert_eq!("1", s(&rec [0]));
+ assert_eq!("2", s(&rec [1]));
+ assert_eq!("3", s(&rec [2]));
+ let mut rec = StringRecord::new();
+ assert!(rdr.read_record(&mut rec).unwrap());
+ assert_eq!("1", &rec [0]);
+ assert_eq!("", &rec [1]);
+ assert_eq!("3", &rec [2]);
+ { let headers = rdr.headers().unwrap(); assert_eq!(3, headers.len()); assert_eq!("foo", &headers [0]); assert_eq!("bar", &headers [1]); assert_eq!("baz", &headers [2]); }
+ }
+ 
+ #[test]
+ fn read_trimmed_header() {
+ let data = b("foo, bar,\tbaz\n 1, 2, 3\n1\t,\t,3\t\t");
+ let mut rdr = ReaderBuilder::new().has_headers(true).trim(Trim::Headers).from_reader(data);
+ let mut rec = ByteRecord::new();
+ assert!(rdr.read_byte_record(&mut rec).unwrap());
+ assert_eq!(" 1", s(&rec [0]));
+ assert_eq!(" 2", s(&rec [1]));
+ assert_eq!(" 3", s(&rec [2]));
+ { let headers = rdr.headers().unwrap(); assert_eq!(3, headers.len()); assert_eq!("foo", &headers [0]); assert_eq!("bar", &headers [1]); assert_eq!("baz", &headers [2]); }
+ }
+ 
+ #[test]
+ fn read_trimed_header_invalid_utf8() {
+ let data = &b"foo, b\xFFar,\tbaz\na,b,c\nd,e,f" [..];
+ let mut rdr = ReaderBuilder::new().has_headers(true).trim(Trim::Headers).from_reader(data);
+ let mut rec = StringRecord::new();
+ let _ = rdr.read_record(&mut rec);
+ { let headers = rdr.byte_headers().unwrap(); assert_eq!(3, headers.len()); assert_eq!(b"foo", &headers [0]); assert_eq!(b"b\xFFar", &headers [1]); assert_eq!(b"baz", &headers [2]); }
+ match * rdr.headers().unwrap_err().kind() { ErrorKind::Utf8 { pos: Some(ref pos), ref err } => { assert_eq!(pos, &newpos(0, 1, 0)); assert_eq!(err.field(), 1); assert_eq!(err.valid_up_to(), 3); } ref err => panic!("match failed, got {:?}", err) }
+ }
+ 
+ #[test]
+ fn read_trimmed_records() {
+ let data = b("foo, bar,\tbaz\n 1, 2, 3\n1\t,\t,3\t\t");
+ let mut rdr = ReaderBuilder::new().has_headers(true).trim(Trim::Fields).from_reader(data);
+ let mut rec = ByteRecord::new();
+ assert!(rdr.read_byte_record(&mut rec).unwrap());
+ assert_eq!("1", s(&rec [0]));
+ assert_eq!("2", s(&rec [1]));
+ assert_eq!("3", s(&rec [2]));
+ { let headers = rdr.headers().unwrap(); assert_eq!(3, headers.len()); assert_eq!("foo", &headers [0]); assert_eq!(" bar", &headers [1]); assert_eq!("\tbaz", &headers [2]); }
+ }
+ 
+ #[test]
+ fn read_trimmed_records_without_headers() {
+ let data = b("a1, b1\t,\t c1\t\n");
+ let mut rdr = ReaderBuilder::new().has_headers(false).trim(Trim::All).from_reader(data);
+ let mut rec = ByteRecord::new();
+ assert!(rdr.read_byte_record(&mut rec).unwrap());
+ assert_eq!("a1", s(&rec [0]));
+ assert_eq!("b1", s(&rec [1]));
+ assert_eq!("c1", s(&rec [2]));
+ }
+ 
+ #[test]
+ fn read_record_unequal_fails() {
+ let data = b("foo\nbar,baz");
+ let mut rdr = ReaderBuilder::new().has_headers(false).from_reader(data);
+ let mut rec = ByteRecord::new();
+ assert!(rdr.read_byte_record(&mut rec).unwrap());
+ assert_eq!(1, rec.len());
+ assert_eq!("foo", s(&rec [0]));
+ match rdr.read_byte_record(&mut rec) { Err(err) => match * err.kind() { ErrorKind::UnequalLengths { expected_len: 1, ref pos, len: 2 } => { assert_eq!(pos, &Some(newpos(4, 2, 1))); } ref wrong => panic!("match failed, got {:?}", wrong) }, wrong => panic!("match failed, got {:?}", wrong) }
+ }
+ 
+ #[test]
+ fn read_record_unequal_ok() {
+ let data = b("foo\nbar,baz");
+ let mut rdr = ReaderBuilder::new().has_headers(false).flexible(true).from_reader(data);
+ let mut rec = ByteRecord::new();
+ assert!(rdr.read_byte_record(&mut rec).unwrap());
+ assert_eq!(1, rec.len());
+ assert_eq!("foo", s(&rec [0]));
+ assert!(rdr.read_byte_record(&mut rec).unwrap());
+ assert_eq!(2, rec.len());
+ assert_eq!("bar", s(&rec [0]));
+ assert_eq!("baz", s(&rec [1]));
+ assert!(! rdr.read_byte_record(&mut rec).unwrap());
+ }
+ 
+ #[test]
+ fn read_record_unequal_continue() {
+ let data = b("foo\nbar,baz\nquux");
+ let mut rdr = ReaderBuilder::new().has_headers(false).from_reader(data);
+ let mut rec = ByteRecord::new();
+ assert!(rdr.read_byte_record(&mut rec).unwrap());
+ assert_eq!(1, rec.len());
+ assert_eq!("foo", s(&rec [0]));
+ match rdr.read_byte_record(&mut rec) { Err(err) => match err.kind() { &ErrorKind::UnequalLengths { expected_len: 1, ref pos, len: 2 } => { assert_eq!(pos, &Some(newpos(4, 2, 1))); } wrong => panic!("match failed, got {:?}", wrong) }, wrong => panic!("match failed, got {:?}", wrong) }
+ assert!(rdr.read_byte_record(&mut rec).unwrap());
+ assert_eq!(1, rec.len());
+ assert_eq!("quux", s(&rec [0]));
+ assert!(! rdr.read_byte_record(&mut rec).unwrap());
+ }
+ 
+ #[test]
+ fn read_record_headers() {
+ let data = b("foo,bar,baz\na,b,c\nd,e,f");
+ let mut rdr = ReaderBuilder::new().has_headers(true).from_reader(data);
+ let mut rec = StringRecord::new();
+ assert!(rdr.read_record(&mut rec).unwrap());
+ assert_eq!(3, rec.len());
+ assert_eq!("a", &rec [0]);
+ assert!(rdr.read_record(&mut rec).unwrap());
+ assert_eq!(3, rec.len());
+ assert_eq!("d", &rec [0]);
+ assert!(! rdr.read_record(&mut rec).unwrap());
+ { let headers = rdr.byte_headers().unwrap(); assert_eq!(3, headers.len()); assert_eq!(b"foo", &headers [0]); assert_eq!(b"bar", &headers [1]); assert_eq!(b"baz", &headers [2]); }
+ { let headers = rdr.headers().unwrap(); assert_eq!(3, headers.len()); assert_eq!("foo", &headers [0]); assert_eq!("bar", &headers [1]); assert_eq!("baz", &headers [2]); }
+ }
+ 
+ #[test]
+ fn read_record_headers_invalid_utf8() {
+ let data = &b"foo,b\xFFar,baz\na,b,c\nd,e,f" [..];
+ let mut rdr = ReaderBuilder::new().has_headers(true).from_reader(data);
+ let mut rec = StringRecord::new();
+ assert!(rdr.read_record(&mut rec).unwrap());
+ assert_eq!(3, rec.len());
+ assert_eq!("a", &rec [0]);
+ assert!(rdr.read_record(&mut rec).unwrap());
+ assert_eq!(3, rec.len());
+ assert_eq!("d", &rec [0]);
+ assert!(! rdr.read_record(&mut rec).unwrap());
+ { let headers = rdr.byte_headers().unwrap(); assert_eq!(3, headers.len()); assert_eq!(b"foo", &headers [0]); assert_eq!(b"b\xFFar", &headers [1]); assert_eq!(b"baz", &headers [2]); }
+ match * rdr.headers().unwrap_err().kind() { ErrorKind::Utf8 { pos: Some(ref pos), ref err } => { assert_eq!(pos, &newpos(0, 1, 0)); assert_eq!(err.field(), 1); assert_eq!(err.valid_up_to(), 1); } ref err => panic!("match failed, got {:?}", err) }
+ }
+ 
+ #[test]
+ fn read_record_no_headers_before() {
+ let data = b("foo,bar,baz\na,b,c\nd,e,f");
+ let mut rdr = ReaderBuilder::new().has_headers(false).from_reader(data);
+ let mut rec = StringRecord::new();
+ { let headers = rdr.headers().unwrap(); assert_eq!(3, headers.len()); assert_eq!("foo", &headers [0]); assert_eq!("bar", &headers [1]); assert_eq!("baz", &headers [2]); }
+ assert!(rdr.read_record(&mut rec).unwrap());
+ assert_eq!(3, rec.len());
+ assert_eq!("foo", &rec [0]);
+ assert!(rdr.read_record(&mut rec).unwrap());
+ assert_eq!(3, rec.len());
+ assert_eq!("a", &rec [0]);
+ assert!(rdr.read_record(&mut rec).unwrap());
+ assert_eq!(3, rec.len());
+ assert_eq!("d", &rec [0]);
+ assert!(! rdr.read_record(&mut rec).unwrap());
+ }
+ 
+ #[test]
+ fn read_record_no_headers_after() {
+ let data = b("foo,bar,baz\na,b,c\nd,e,f");
+ let mut rdr = ReaderBuilder::new().has_headers(false).from_reader(data);
+ let mut rec = StringRecord::new();
+ assert!(rdr.read_record(&mut rec).unwrap());
+ assert_eq!(3, rec.len());
+ assert_eq!("foo", &rec [0]);
+ assert!(rdr.read_record(&mut rec).unwrap());
+ assert_eq!(3, rec.len());
+ assert_eq!("a", &rec [0]);
+ assert!(rdr.read_record(&mut rec).unwrap());
+ assert_eq!(3, rec.len());
+ assert_eq!("d", &rec [0]);
+ assert!(! rdr.read_record(&mut rec).unwrap());
+ let headers = rdr.headers().unwrap();
+ assert_eq!(3, headers.len());
+ assert_eq!("foo", &headers [0]);
+ assert_eq!("bar", &headers [1]);
+ assert_eq!("baz", &headers [2]);
+ }
+ 
+ #[test]
+ fn seek() {
+ let data = b("foo,bar,baz\na,b,c\nd,e,f\ng,h,i");
+ let mut rdr = ReaderBuilder::new().from_reader(io::Cursor::new(data));
+ rdr.seek(newpos(18, 3, 2)).unwrap();
+ let mut rec = StringRecord::new();
+ assert_eq!(18, rdr.position().byte());
+ assert!(rdr.read_record(&mut rec).unwrap());
+ assert_eq!(3, rec.len());
+ assert_eq!("d", &rec [0]);
+ assert_eq!(24, rdr.position().byte());
+ assert_eq!(4, rdr.position().line());
+ assert_eq!(3, rdr.position().record());
+ assert!(rdr.read_record(&mut rec).unwrap());
+ assert_eq!(3, rec.len());
+ assert_eq!("g", &rec [0]);
+ assert!(! rdr.read_record(&mut rec).unwrap());
+ }
+ 
+ #[test]
+ fn seek_headers_after() {
+ let data = b("foo,bar,baz\na,b,c\nd,e,f\ng,h,i");
+ let mut rdr = ReaderBuilder::new().from_reader(io::Cursor::new(data));
+ rdr.seek(newpos(18, 3, 2)).unwrap();
+ assert_eq!(rdr.headers().unwrap(), vec ! ["foo", "bar", "baz"]);
+ }
+ 
+ #[test]
+ fn seek_headers_before_after() {
+ let data = b("foo,bar,baz\na,b,c\nd,e,f\ng,h,i");
+ let mut rdr = ReaderBuilder::new().from_reader(io::Cursor::new(data));
+ let headers = rdr.headers().unwrap().clone();
+ rdr.seek(newpos(18, 3, 2)).unwrap();
+ assert_eq!(&headers, rdr.headers().unwrap());
+ }
+ 
+ #[test]
+ fn seek_headers_no_actual_seek() {
+ let data = b("foo,bar,baz\na,b,c\nd,e,f\ng,h,i");
+ let mut rdr = ReaderBuilder::new().from_reader(io::Cursor::new(data));
+ rdr.seek(Position::new()).unwrap();
+ assert_eq!("foo", &rdr.headers().unwrap() [0]);
+ }
+ 
+ #[test]
+ fn positions_no_headers() {
+ let mut rdr = ReaderBuilder::new().has_headers(false).from_reader("a,b,c\nx,y,z" . as_bytes()).into_records();
+ let pos = rdr.next().unwrap().unwrap().position().unwrap().clone();
+ assert_eq!(pos.byte(), 0);
+ assert_eq!(pos.line(), 1);
+ assert_eq!(pos.record(), 0);
+ let pos = rdr.next().unwrap().unwrap().position().unwrap().clone();
+ assert_eq!(pos.byte(), 6);
+ assert_eq!(pos.line(), 2);
+ assert_eq!(pos.record(), 1);
+ }
+ 
+ #[test]
+ fn positions_headers() {
+ let mut rdr = ReaderBuilder::new().has_headers(true).from_reader("a,b,c\nx,y,z" . as_bytes()).into_records();
+ let pos = rdr.next().unwrap().unwrap().position().unwrap().clone();
+ assert_eq!(pos.byte(), 6);
+ assert_eq!(pos.line(), 2);
+ assert_eq!(pos.record(), 1);
+ }
+ 
+ #[test]
+ fn headers_on_empty_data() {
+ let mut rdr = ReaderBuilder::new().from_reader("" . as_bytes());
+ let r = rdr.byte_headers().unwrap();
+ assert_eq!(r.len(), 0);
+ }
+ 
+ #[test]
+ fn no_headers_on_empty_data() {
+ let mut rdr = ReaderBuilder::new().has_headers(false).from_reader("" . as_bytes());
+ assert_eq!(rdr.records().count(), 0);
+ }
+ 
+ #[test]
+ fn no_headers_on_empty_data_after_headers() {
+ let mut rdr = ReaderBuilder::new().has_headers(false).from_reader("" . as_bytes());
+ assert_eq!(rdr.headers().unwrap().len(), 0);
+ assert_eq!(rdr.records().count(), 0);
+ }
+ 
+}
+

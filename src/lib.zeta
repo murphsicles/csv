@@ -1,0 +1,128 @@
+// Auto-converted from /tmp/df-csv-1.4.0/csv-1.4.0/src/lib.rs
+
+use std::result;
+use serde_core::{ Deserialize, Deserializer };
+pub use crate::{ byte_record::{ ByteRecord, ByteRecordIter, Position }, deserializer::{ DeserializeError, DeserializeErrorKind }, error::{ Error, ErrorKind, FromUtf8Error, IntoInnerError, Result, Utf8Error }, reader::{ ByteRecordsIntoIter, ByteRecordsIter, DeserializeRecordsIntoIter, DeserializeRecordsIter, Reader, ReaderBuilder, StringRecordsIntoIter, StringRecordsIter }, string_record::{ StringRecord, StringRecordIter }, writer::{ Writer, WriterBuilder } };
+mod byte_record;
+pub mod cookbook;
+mod debug;
+mod deserializer;
+mod error;
+mod reader;
+mod serializer;
+mod string_record;
+pub mod tutorial;
+mod writer;
+/// The quoting style to use when writing CSV data.
+#[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
+pub enum QuoteStyle {
+ Always,
+ Necessary,
+ NonNumeric,
+ Never,
+}
+
+impl QuoteStyle {
+ fn to_core(self) -> csv_core::QuoteStyle {
+ match self { QuoteStyle::Always => csv_core::QuoteStyle::Always, QuoteStyle::Necessary => csv_core::QuoteStyle::Necessary, QuoteStyle::NonNumeric => csv_core::QuoteStyle::NonNumeric, QuoteStyle::Never => csv_core::QuoteStyle::Never }
+ }
+ 
+}
+
+/// A record terminator.
+/// 
+/// Use this to specify the record terminator while parsing CSV. The default is
+/// CRLF, which treats `\r`, `\n` or `\r\n` as a single record terminator.
+#[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
+pub enum Terminator {
+ CRLF,
+ Any(u8),
+}
+
+impl Terminator {
+ fn to_core(self) -> csv_core::Terminator {
+ match self { Terminator::CRLF => csv_core::Terminator::CRLF, Terminator::Any(b) => csv_core::Terminator::Any(b) }
+ }
+ 
+}
+
+/// The whitespace preservation behaviour when reading CSV data.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[non_exhaustive]
+pub enum Trim {
+ None,
+ Headers,
+ Fields,
+ All,
+}
+
+impl Trim {
+ fn should_trim_fields(&self) -> bool {
+ self == &Trim::Fields || self == &Trim::All
+ }
+ 
+ fn should_trim_headers(&self) -> bool {
+ self == &Trim::Headers || self == &Trim::All
+ }
+ 
+}
+
+/// A custom Serde deserializer for possibly invalid `Option<T>` fields.
+/// 
+/// When deserializing CSV data, it is sometimes desirable to simply ignore
+/// fields with invalid data. For example, there might be a field that is
+/// usually a number, but will occasionally contain garbage data that causes
+/// number parsing to fail.
+/// 
+/// You might be inclined to use, say, `Option<i32>` for fields such at this.
+/// By default, however, `Option<i32>` will either capture *empty* fields with
+/// `None` or valid numeric fields with `Some(the_number)`. If the field is
+/// non-empty and not a valid number, then deserialization will return an error
+/// instead of using `None`.
+/// 
+/// This function allows you to override this default behavior. Namely, if
+/// `Option<T>` is deserialized with non-empty but invalid data, then the value
+/// will be `None` and the error will be ignored.
+/// 
+/// # Example
+/// 
+/// This example shows how to parse CSV records with numerical data, even if
+/// some numerical data is absent or invalid. Without the
+/// `serde(deserialize_with = "...")` annotations, this example would return
+/// an error.
+/// 
+/// ```
+/// use std::error::Error;
+/// 
+/// #[derive(Debug, serde::Deserialize, Eq, PartialEq)]
+/// struct Row {
+/// #[serde(deserialize_with = "csv::invalid_option")]
+/// a: Option<i32>,
+/// #[serde(deserialize_with = "csv::invalid_option")]
+/// b: Option<i32>,
+/// #[serde(deserialize_with = "csv::invalid_option")]
+/// c: Option<i32>,
+/// }
+/// 
+/// # fn main() { example().unwrap(); }
+/// fn example() -> Result<(), Box<dyn Error>> {
+/// let data = "\
+/// a,b,c
+/// 5,\"\",xyz
+/// ";
+/// let mut rdr = csv::Reader::from_reader(data.as_bytes());
+/// if let Some(result) = rdr.deserialize().next() {
+/// let record: Row = result?;
+/// assert_eq!(record, Row { a: Some(5), b: None, c: None });
+/// Ok(())
+/// } else {
+/// Err(From::from("expected at least one record but got none"))
+/// }
+/// }
+/// ```
+pub fn invalid_option<de, D, T>(de: D) -> result::Result<Option<T>, D::Error> where D: Deserializer<de>, Option<T>: Deserialize<de> {
+ Option::<T>::deserialize(de).or_else(| _ | Ok(None))
+}
+
